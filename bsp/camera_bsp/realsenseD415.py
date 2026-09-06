@@ -4,10 +4,11 @@ import cv2
 
 class Camera(object):
 
-    def __init__(self,width=640,height=480,fps=30):
+    def __init__(self,width=640,height=480,fps=30,serial=None):
         self.im_height = height
         self.im_width = width
         self.fps = fps
+        self.serial = serial
         self.intrinsics = None
         self.scale = None
         self.pipeline = None
@@ -20,6 +21,8 @@ class Camera(object):
         # Configure depth and color streams
         self.pipeline = rs.pipeline()
         config = rs.config()
+        if self.serial:
+            config.enable_device(self.serial)
         config.enable_stream(rs.stream.depth, self.im_width, self.im_height, rs.format.z16, self.fps)
         config.enable_stream(rs.stream.color, self.im_width, self.im_height, rs.format.bgr8, self.fps)
 
@@ -30,9 +33,14 @@ class Camera(object):
         rgb_profile = cfg.get_stream(rs.stream.color)
         self.intrinsics = self.get_intrinsics(rgb_profile)
         # Determine depth scale
-        self.scale = cfg.get_device().first_depth_sensor().get_depth_scale()
-        #print("camera depth scale:",self.scale)
-        print("D415 have connected ...")
+        dev = cfg.get_device()
+        self.scale = dev.first_depth_sensor().get_depth_scale()
+        print("Camera connected: %s (serial=%s)" % (
+            dev.get_info(rs.camera_info.name),
+            dev.get_info(rs.camera_info.serial_number)))
+        print("Color intrinsics fx=%.3f fy=%.3f cx=%.3f cy=%.3f  depth_scale=%.6f"
+              % (self.intrinsics[0, 0], self.intrinsics[1, 1],
+                 self.intrinsics[0, 2], self.intrinsics[1, 2], self.scale))
 
     def get_data(self):
         # Wait for a coherent pair of frames: depth and color

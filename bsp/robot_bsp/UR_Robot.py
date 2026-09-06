@@ -1,4 +1,7 @@
 import time
+import os
+import cv2
+import configparser
 import rtde_control
 import rtde_receive
 import minimalmodbus
@@ -10,18 +13,65 @@ import math
 from ..camera_bsp.realsenseD415 import Camera
 
 
+def load_camera_ini(path):
+    """读取标定生成的 camera_*.ini，返回 (K3x3, dist1x5)；失败返回 None。"""
+    if not os.path.exists(path):
+        print('未找到相机标定文件: %s (回退到 RealSense 出厂内参, 不去畸变)' % path)
+        return None
+    cfg = configparser.ConfigParser()
+    cfg.read(path)
+    try:
+        fx = float(cfg.get('camera_parameters', 'fx'))
+        fy = float(cfg.get('camera_parameters', 'fy'))
+        cx = float(cfg.get('camera_parameters', 'cx'))
+        cy = float(cfg.get('camera_parameters', 'cy'))
+        k1 = float(cfg.get('distortion_parameters', 'k1'))
+        k2 = float(cfg.get('distortion_parameters', 'k2'))
+        p1 = float(cfg.get('distortion_parameters', 'p1', fallback=0.0))
+        p2 = float(cfg.get('distortion_parameters', 'p2', fallback=0.0))
+        k3 = float(cfg.get('distortion_parameters', 'k3', fallback=0.0))
+    except Exception as e:
+        print('解析相机标定文件失败: %s (%s)，回退到出厂内参' % (path, e))
+        return None
+    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    dist = np.array([[k1, k2, p1, p2, k3]], dtype=np.float64)
+    return K, dist
+
+
 lock = threading.Lock()
 
+
+def _rotation_vector_to_matrix(rvec):
+    """Rodrigues: 旋转向量 -> 3x3 旋转矩阵"""
+    rvec = np.asarray(rvec, dtype=np.float64)
+    theta = np.linalg.norm(rvec)
+    if theta < 1e-12:
+        return np.eye(3)
+    k = rvec / theta
+    K = np.array([[0.0, -k[2], k[1]],
+                  [k[2], 0.0, -k[0]],
+                  [-k[1], k[0], 0.0]])
+    return np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
+
+
 class UR_Robot:
-    def __init__(self, robot_ip="192.168.1.35", workspace_limits=None, is_use_robot=True, is_use_camera=True):
+    def __init__(self, robot_ip="192.168.1.35", workspace_limits=None, is_use_robot=True,
+                 is_use_camera=True, connect_robot=True, cam2end_path="cam2end_20260906.txt",
+                 camera_serial="215222074676", cam_ini_path="camera_20260906.ini",
+                 undistort_img=False):
         if workspace_limits is None:
             #workspace_limits = [[-0.450, -0.200], [-0.65, -0.47], [0.003, 0.45]]
             workspace_limits = [[-1, 1], [-1, 1], [0.003, 0.9]]
         self.workspace_limits = workspace_limits
-        self.rtde_c = rtde_control.RTDEControlInterface(robot_ip)
-        self.rtde_r = rtde_receive.RTDEReceiveInterface(robot_ip)
+        self.connect_robot = connect_robot
         self.is_use_robotiq85 = is_use_robot
         self.is_use_camera = is_use_camera
+        if connect_robot:
+            self.rtde_c = rtde_control.RTDEControlInterface(robot_ip)
+            self.rtde_r = rtde_receive.RTDEReceiveInterface(robot_ip)
+        else:
+            self.rtde_c = None
+            self.rtde_r = None
 
 
         self.joint_acc = 0.2  
@@ -39,15 +89,35 @@ class UR_Robot:
 
         if(self.is_use_camera):
             # Fetch RGB-D data from RealSense camera
-            self.camera = Camera()
-            #self.cam_intrinsics = np.array([386.89120483,0,321.61746216,0,386.45446777,237.19995117,0,0,1]).reshape(3,3)
-            self.cam_intrinsics = np.array([386.471, 0, 321.617, 0, 386.034, 237.2, 0, 0, 1]).reshape(3, 3)
-            # Load camera pose (from running calibrate.py), intrinsics and depth scale
-        self.cam_pose = np.loadtxt('real/cam_pose/camera_pose.txt', delimiter=' ')
-        self.cam_depth_scale = np.loadtxt('real/cam_pose/camera_depth_scale.txt', delimiter=' ')
+            self.camera = Camera(serial=camera_serial)
+            self.cam_intrinsics = self.camera.intrinsics
+            self.depth_scale = self.camera.scale
+            # 眼在手：相机到末端齐次变换 (cam->end，平移单位 mm)
+            self.cam2end_path = cam2end_path
+            self.T_cam2end = np.loadtxt(self.cam2end_path, delimiter=' ')
+            print('T_cam2end (cam->end, translation in mm):')
+            print(self.T_cam2end)
+            # 标定内参/畸变：仅用于像素点级校正(undistort_points)，不改动整幅画面
+            self.und_map1 = None
+            self.und_map2 = None
+            self.dist_calib = None
+            calib = load_camera_ini(cam_ini_path)
+            if calib is not None:
+                K_calib, dist_calib = calib
+                self.dist_calib = dist_calib
+                self.cam_intrinsics = K_calib
+                print('已加载标定内参:')
+                print(self.cam_intrinsics)
+                print('dist =', dist_calib.tolist())
+                # 整幅图去畸变默认关闭(会改变画面观感)，仅当 undistort_img=True 时启用
+                if undistort_img:
+                    w, h = self.camera.im_width, self.camera.im_height
+                    self.und_map1, self.und_map2 = cv2.initUndistortRectifyMap(
+                        K_calib, dist_calib, None, K_calib, (w, h), cv2.CV_32FC1)
+                    print('已启用整幅图去畸变(undistort_img=True)')
         
 # Define the robot control class
-    def moveL(self, target_pose, speed=0.1, acceleration=0.1):
+    def moveL(self, target_pose, speed=0.05, acceleration=0.05):
         self.rtde_c.moveL(target_pose, speed, acceleration)
         actual_tool_positions = self.get_actual_tcp_pose()
         while not all([np.abs(actual_tool_positions[j] - target_pose[j]) < self.tool_pose_tolerance[j] for j in range(3)]):
@@ -55,7 +125,7 @@ class UR_Robot:
             time.sleep(0.01)
         time.sleep(1.5)  
 
-    def moveJ(self, target_joint, speed=0.2, acceleration=0.2):
+    def moveJ(self, target_joint, speed=0.05, acceleration=0.05):
         self.rtde_c.moveJ(target_joint, speed, acceleration)
         actual_joint_positions = self.get_actual_joint_position()
         while not all([np.abs(actual_joint_positions[j] - target_joint[j]) < self.joint_tolerance[j] for j in range(len(target_joint))]):
@@ -74,11 +144,56 @@ class UR_Robot:
 
     def get_robot_status(self):
         return self.rtde_r.getRobotStatus()
-    
-    
+
+    def pose_vector_to_matrix(self, pose):
+        """[x,y,z,rx,ry,rz] (单位 m，旋转向量) -> 4x4 齐次矩阵 (平移单位 mm)"""
+        T = np.eye(4)
+        T[:3, :3] = _rotation_vector_to_matrix(pose[3:6])
+        T[:3, 3] = np.asarray(pose[0:3], dtype=np.float64) * 1000.0
+        return T
+
+    def pixel_to_camera(self, u, v, z_mm):
+        """像素 + 深度(mm) -> 相机系 3D 坐标 (mm)。
+        若加载了标定畸变，先用 undistort_points 把像素校正为理想坐标再反投影
+        (画面不做整幅去畸变，仅做点级校正)。"""
+        K = self.cam_intrinsics
+        if self.dist_calib is not None:
+            pts = cv2.undistortPoints(
+                np.array([[[float(u), float(v)]]], dtype=np.float32),
+                K, self.dist_calib, P=K)
+            u, v = float(pts[0, 0, 0]), float(pts[0, 0, 1])
+        fx = K[0, 0]
+        fy = K[1, 1]
+        cx = K[0, 2]
+        cy = K[1, 2]
+        x = (u - cx) * z_mm / fx
+        y = (v - cy) * z_mm / fy
+        return np.array([x, y, z_mm], dtype=np.float64)
+
+    def camera_to_base(self, p_cam_mm, tcp_pose=None):
+        """相机系 3D 点(mm) -> 机器人基座坐标，返回 (mm, m)。
+        P_base = T_end2base @ T_cam2end @ P_cam
+        tcp_pose 缺省时实时读取当前位姿"""
+        if tcp_pose is None:
+            tcp_pose = self.get_actual_tcp_pose()
+        T_end2base = self.pose_vector_to_matrix(tcp_pose)
+        p_cam_h = np.concatenate([p_cam_mm, [1.0]])
+        p_base_mm = (T_end2base @ self.T_cam2end @ p_cam_h)[:3]
+        return p_base_mm, p_base_mm / 1000.0
+
+    def pixel_to_base(self, u, v, z_mm, tcp_pose=None):
+        """像素 + 深度(mm) -> 机器人基座坐标，返回 (mm, m)"""
+        p_cam = self.pixel_to_camera(u, v, z_mm)
+        return self.camera_to_base(p_cam, tcp_pose=tcp_pose)
+
     ## get camera data
     def get_camera_data(self):
         color_img, depth_img = self.camera.get_data()
+        if self.und_map1 is not None:
+            color_img = cv2.remap(color_img, self.und_map1, self.und_map2,
+                                  cv2.INTER_LINEAR)
+            depth_img = cv2.remap(depth_img, self.und_map1, self.und_map2,
+                                  cv2.INTER_NEAREST)
         return color_img, depth_img
     
     def angle_to_cartesian(self,angle_degrees):
